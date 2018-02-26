@@ -205,6 +205,7 @@ pub struct Daemonize<T> {
     chown_pid_file: bool,
     user: Option<User>,
     group: Option<Group>,
+    stream_redirect: Option<PathBuf>,
     umask: mode_t,
     privileged_action: Box<Fn() -> T>,
 }
@@ -229,6 +230,7 @@ impl Daemonize<()> {
             directory: Path::new("/").to_owned(),
             pid_file: None,
             chown_pid_file: false,
+            stream_redirect: None,
             user: None,
             group: None,
             umask: 0o027,
@@ -275,6 +277,11 @@ impl<T> Daemonize<T> {
         self
     }
 
+    pub fn stream_redirect<F: AsRef<Path>>(mut self, stream_redirect: F) -> Self {
+        self.stream_redirect = Some(stream_redirect.as_ref().to_owned());
+        self
+    }
+
     /// Execute `action` just before dropping privileges. Most common usecase is to open listening socket.
     /// Result of `action` execution will be returned by `start` method.
     pub fn privileged_action<N, F: Fn() -> N + Sized + 'static>(self, action: F) -> Daemonize<N> {
@@ -307,7 +314,7 @@ impl<T> Daemonize<T> {
 
             try!(perform_fork());
 
-            try!(redirect_standard_streams());
+            try!(redirect_standard_streams(&self.stream_redirect.unwrap_or(PathBuf::from("/dev/null"))));
 
             let uid = maptry!(self.user, get_user);
             let gid = maptry!(self.group, get_group);
@@ -352,7 +359,7 @@ unsafe fn set_sid() -> Result<()> {
     tryret!(setsid(), Ok(()), DaemonizeError::DetachSession)
 }
 
-unsafe fn redirect_standard_streams() -> Result<()> {
+unsafe fn redirect_standard_streams(path: &PathBuf) -> Result<()> {
     macro_rules! for_every_stream {
         ($expr:expr) => (
             for stream in &[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
@@ -362,14 +369,15 @@ unsafe fn redirect_standard_streams() -> Result<()> {
     }
     for_every_stream!(close);
 
-    let devnull_file = fopen(transmute(b"/dev/null\0"), transmute(b"w+\0"));
-    if devnull_file.is_null() {
+    let path = CString::new(path.to_string_lossy().into_owned()).map_err(|_| DaemonizeError::RedirectStreams(0))?;
+    let file = fopen(path.as_ptr(), transmute(b"a+\0"));
+    if file.is_null() {
         return Err(DaemonizeError::RedirectStreams(errno()))
     };
 
-    let devnull_fd = fileno(devnull_file);
-    for_every_stream!(|stream| dup2(devnull_fd, stream));
-    tryret!(close(devnull_fd), (), DaemonizeError::RedirectStreams);
+    let fd = fileno(file);
+    for_every_stream!(|stream| dup2(fd, stream));
+    tryret!(close(fd), (), DaemonizeError::RedirectStreams);
 
     Ok(())
 }
